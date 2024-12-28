@@ -1,39 +1,35 @@
-import React from 'react'
-import { StyleSheet, useWindowDimensions, View } from 'react-native'
-import PagerView from 'react-native-pager-view'
-import Animated, {
-  runOnJS,
-  runOnUI,
-  useAnimatedReaction,
-  useAnimatedStyle,
-  useDerivedValue,
-  useSharedValue,
-  withDelay,
-  withTiming,
-  useFrameCallback,
-} from 'react-native-reanimated'
+import React, { forwardRef, useRef, useImperativeHandle } from 'react';
+import { StyleSheet, useWindowDimensions, View, findNodeHandle } from 'react-native';
+import PagerView from 'react-native-pager-view';
+import Animated, { runOnJS, runOnUI, useAnimatedReaction, useAnimatedStyle, useDerivedValue, useSharedValue, withDelay, withTiming } from 'react-native-reanimated';
+import { Context, TabNameContext } from './Context';
+import { Lazy } from './Lazy';
+import { MaterialTabBar, TABBAR_HEIGHT } from './MaterialTabBar';
+import { Tab } from './Tab';
+import { IS_IOS, ONE_FRAME_MS, scrollToImpl } from './helpers';
+import { useAnimatedDynamicRefs, useContainerRef, usePageScrollHandler, useTabProps } from './hooks';
 
-import { Context, TabNameContext } from './Context'
-import { Lazy } from './Lazy'
-import { MaterialTabBar, TABBAR_HEIGHT } from './MaterialTabBar'
-import { Tab } from './Tab'
-import { IS_IOS, ONE_FRAME_MS, scrollToImpl } from './helpers'
-import {
-  useAnimatedDynamicRefs,
-  useContainerRef,
-  usePageScrollHandler,
-  useTabProps,
-  useLayoutHeight,
-} from './hooks'
-import {
-  CollapsibleProps,
-  CollapsibleRef,
-  ContextType,
-  IndexChangeEventData,
-  TabName,
-} from './types'
+/**
+ * Wrapper component around PagerView to implement getComponentViewTag.
+ * This method is required by react-native-reanimated to access internal instance handles.
+ */
+const PagerViewWithTag = forwardRef((props, ref) => {
+  const pagerViewRef = useRef(null);
 
-const AnimatedPagerView = Animated.createAnimatedComponent(PagerView)
+  useImperativeHandle(ref, () => ({
+    // Implement getComponentViewTag to return the view tag
+    getComponentViewTag: () => {
+      return findNodeHandle(pagerViewRef.current);
+    },
+    // Optionally, forward other methods if needed
+    // For example, if you need to call methods on PagerView
+    ...pagerViewRef.current,
+  }));
+
+  return <PagerView ref={pagerViewRef} {...props} />;
+});
+
+const AnimatedPagerView = Animated.createAnimatedComponent(PagerViewWithTag);
 
 /**
  * Basic usage looks like this:
@@ -55,412 +51,329 @@ const AnimatedPagerView = Animated.createAnimatedComponent(PagerView)
  * }
  * ```
  */
+
 export const Container = React.memo(
-  React.forwardRef<CollapsibleRef, CollapsibleProps>(
-    (
-      {
-        initialTabName,
-        headerHeight: initialHeaderHeight,
-        minHeaderHeight = 0,
-        tabBarHeight: initialTabBarHeight = TABBAR_HEIGHT,
-        revealHeaderOnScroll = false,
-        snapThreshold,
-        children,
-        renderHeader,
-        renderTabBar = (props) => <MaterialTabBar {...props} />,
-        headerContainerStyle,
-        cancelTranslation,
-        containerStyle,
-        lazy,
-        cancelLazyFadeIn,
-        pagerProps,
-        onIndexChange,
-        onTabChange,
-        width: customWidth,
-        allowHeaderOverscroll,
+  forwardRef((_ref, ref) => {
+    let {
+      initialTabName,
+      headerHeight: initialHeaderHeight,
+      minHeaderHeight = 0,
+      tabBarHeight: initialTabBarHeight = TABBAR_HEIGHT,
+      revealHeaderOnScroll = false,
+      snapThreshold,
+      children,
+      renderHeader,
+      renderTabBar = props => <MaterialTabBar {...props} />,
+      headerContainerStyle,
+      cancelTranslation,
+      containerStyle,
+      lazy,
+      cancelLazyFadeIn,
+      pagerProps,
+      onIndexChange,
+      onTabChange,
+      width: customWidth,
+      allowHeaderOverscroll,
+    } = _ref;
+
+    const containerRef = useContainerRef();
+    const [tabProps, tabNamesArray] = useTabProps(children, Tab);
+    const [refMap, setRef] = useAnimatedDynamicRefs();
+    const windowWidth = useWindowDimensions().width;
+    const width = customWidth ?? windowWidth;
+    const containerHeight = useSharedValue(undefined);
+    const tabBarHeight = useSharedValue(initialTabBarHeight);
+    const headerHeight = useSharedValue(!renderHeader ? 0 : initialHeaderHeight);
+    const contentInset = useDerivedValue(() => {
+      if (allowHeaderOverscroll) return 0; // necessary for the refresh control on iOS to be positioned underneath the header
+      // this also adjusts the scroll bars to clamp underneath the header area
+      return IS_IOS ? (headerHeight.value || 0) + (tabBarHeight.value || 0) : 0;
+    });
+    const snappingTo = useSharedValue(0);
+    const offset = useSharedValue(0);
+    const accScrollY = useSharedValue(0);
+    const oldAccScrollY = useSharedValue(0);
+    const accDiffClamp = useSharedValue(0);
+    const scrollYCurrent = useSharedValue(0);
+    const scrollY = useSharedValue(Object.fromEntries(tabNamesArray.map(n => [n, 0])));
+    const contentHeights = useSharedValue(tabNamesArray.map(() => 0));
+    const tabNames = useDerivedValue(() => tabNamesArray, [tabNamesArray]);
+    const index = useSharedValue(initialTabName ? tabNames.value.findIndex(n => n === initialTabName) : 0);
+    const focusedTab = useDerivedValue(() => {
+      return tabNames.value[index.value];
+    }, [tabNames]);
+    const calculateNextOffset = useSharedValue(index.value);
+    const headerScrollDistance = useDerivedValue(() => {
+      return headerHeight.value !== undefined ? headerHeight.value - minHeaderHeight : 0;
+    }, [headerHeight, minHeaderHeight]);
+    const indexDecimal = useSharedValue(index.value);
+    const afterRender = useSharedValue(0);
+
+    React.useEffect(() => {
+      afterRender.value = withDelay(ONE_FRAME_MS * 5, withTiming(1, { duration: 0 }));
+    }, [afterRender, tabNamesArray]);
+
+    const resyncTabScroll = () => {
+      'worklet';
+      for (const name of tabNamesArray) {
+        scrollToImpl(refMap[name], 0, scrollYCurrent.value - contentInset.value, false);
+      }
+    }; // the purpose of this is to scroll to the proper position if dynamic tabs are changing
+
+    useAnimatedReaction(
+      () => afterRender.value === 1,
+      trigger => {
+        if (trigger) {
+          afterRender.value = 0;
+          resyncTabScroll();
+        }
       },
-      ref
-    ) => {
-      const containerRef = useContainerRef()
+      [tabNamesArray, refMap, afterRender, contentInset]
+    ); // derived from scrollX
+    // calculate the next offset and index if swiping
+    // if scrollX changes from tab press,
+    // the same logic must be done, but knowing
+    // the next index in advance
 
-      const [tabProps, tabNamesArray] = useTabProps(children, Tab)
+    useAnimatedReaction(
+      () => Math.round(indexDecimal.value),
+      nextIndex => {
+        if (nextIndex !== null && nextIndex !== index.value) {
+          calculateNextOffset.value = nextIndex;
+        }
+      },
+      []
+    );
 
-      const [refMap, setRef] = useAnimatedDynamicRefs()
+    const propagateTabChange = React.useCallback(
+      change => {
+        onTabChange?.(change);
+        onIndexChange?.(change.index);
+      },
+      [onIndexChange, onTabChange]
+    );
 
-      const windowWidth = useWindowDimensions().width
-      const width = customWidth ?? windowWidth
+    useAnimatedReaction(
+      () => calculateNextOffset.value,
+      i => {
+        if (i !== index.value) {
+          offset.value =
+            scrollY.value[tabNames.value[index.value]] -
+            scrollY.value[tabNames.value[i]] +
+            offset.value;
+          runOnJS(propagateTabChange)({
+            prevIndex: index.value,
+            index: i,
+            prevTabName: tabNames.value[index.value],
+            tabName: tabNames.value[i],
+          });
+          index.value = i;
 
-      const [containerHeight, getContainerLayoutHeight] = useLayoutHeight()
+          if (typeof scrollY.value[tabNames.value[index.value]] === 'number') {
+            scrollYCurrent.value = scrollY.value[tabNames.value[index.value]] || 0;
+          }
+        }
+      },
+      []
+    );
 
-      const [tabBarHeight, getTabBarHeight] =
-        useLayoutHeight(initialTabBarHeight)
-
-      const [headerHeight, getHeaderHeight] = useLayoutHeight(
-        !renderHeader ? 0 : initialHeaderHeight
-      )
-      const initialIndex = React.useMemo(
-        () =>
-          initialTabName
-            ? tabNamesArray.findIndex((n) => n === initialTabName)
-            : 0,
-        [initialTabName, tabNamesArray]
-      )
-
-      const contentInset = React.useMemo(() => {
-        if (allowHeaderOverscroll) return 0
-
-        // necessary for the refresh control on iOS to be positioned underneath the header
-        // this also adjusts the scroll bars to clamp underneath the header area
-        return IS_IOS ? (headerHeight || 0) + (tabBarHeight || 0) : 0
-      }, [headerHeight, tabBarHeight, allowHeaderOverscroll])
-
-      const snappingTo: ContextType['snappingTo'] = useSharedValue(0)
-      const offset: ContextType['offset'] = useSharedValue(0)
-      const accScrollY: ContextType['accScrollY'] = useSharedValue(0)
-      const oldAccScrollY: ContextType['oldAccScrollY'] = useSharedValue(0)
-      const accDiffClamp: ContextType['accDiffClamp'] = useSharedValue(0)
-      const scrollYCurrent: ContextType['scrollYCurrent'] = useSharedValue(0)
-      const scrollY: ContextType['scrollY'] = useSharedValue(
-        Object.fromEntries(tabNamesArray.map((n) => [n, 0]))
-      )
-
-      const contentHeights: ContextType['contentHeights'] = useSharedValue(
-        tabNamesArray.map(() => 0)
-      )
-
-      const tabNames: ContextType['tabNames'] = useDerivedValue<TabName[]>(
-        () => tabNamesArray,
-        [tabNamesArray]
-      )
-      const index: ContextType['index'] = useSharedValue(initialIndex)
-
-      const focusedTab: ContextType['focusedTab'] =
-        useDerivedValue<TabName>(() => {
-          return tabNames.value[index.value]
-        }, [tabNames])
-      const calculateNextOffset = useSharedValue(initialIndex)
-      const headerScrollDistance: ContextType['headerScrollDistance'] =
-        useDerivedValue(() => {
-          return headerHeight !== undefined ? headerHeight - minHeaderHeight : 0
-        }, [headerHeight, minHeaderHeight])
-
-      const indexDecimal: ContextType['indexDecimal'] = useSharedValue(
-        index.value
-      )
-
-      const afterRender = useSharedValue(0)
-      React.useEffect(() => {
-        afterRender.value = withDelay(
-          ONE_FRAME_MS * 5,
-          withTiming(1, { duration: 0 })
-        )
-      }, [afterRender, tabNamesArray])
-
-      const resyncTabScroll = () => {
-        'worklet'
-        for (const name of tabNamesArray) {
-          scrollToImpl(
-            refMap[name],
-            0,
-            scrollYCurrent.value - contentInset,
-            false
-          )
+    useAnimatedReaction(
+      () => headerHeight.value,
+      (_current, prev) => {
+        if (prev === undefined) {
+          // sync scroll if we started with undefined header height
+          resyncTabScroll();
         }
       }
+    );
 
-      // the purpose of this is to scroll to the proper position if dynamic tabs are changing
-      useAnimatedReaction(
-        () => {
-          return afterRender.value === 1
-        },
-        (trigger) => {
-          if (trigger) {
-            afterRender.value = 0
-            resyncTabScroll()
-          }
-        },
-        [tabNamesArray, refMap, afterRender, contentInset]
-      )
+    const headerTranslateY = useDerivedValue(() => {
+      return revealHeaderOnScroll
+        ? -accDiffClamp.value
+        : -Math.min(scrollYCurrent.value, headerScrollDistance.value);
+    }, [revealHeaderOnScroll]);
 
-      // derived from scrollX
-      // calculate the next offset and index if swiping
-      // if scrollX changes from tab press,
-      // the same logic must be done, but knowing
-      // the next index in advance
-      useAnimatedReaction(
-        () => {
-          const nextIndex = Math.round(indexDecimal.value)
-          return nextIndex
-        },
-        (nextIndex) => {
-          if (nextIndex !== null && nextIndex !== index.value) {
-            calculateNextOffset.value = nextIndex
-          }
-        },
-        []
-      )
+    const stylez = useAnimatedStyle(() => {
+      return {
+        transform: [{ translateY: headerTranslateY.value }],
+      };
+    }, [revealHeaderOnScroll]);
 
-      const propagateTabChange = React.useCallback(
-        (change: IndexChangeEventData<TabName>) => {
-          onTabChange?.(change)
-          onIndexChange?.(change.index)
-        },
-        [onIndexChange, onTabChange]
-      )
+    const getHeaderHeight = React.useCallback(
+      event => {
+        const height = event.nativeEvent.layout.height;
 
-      const syncCurrentTabScrollPosition = () => {
-        'worklet'
+        if (headerHeight.value !== height) {
+          headerHeight.value = height;
+        }
+      },
+      [headerHeight]
+    );
 
-        const name = tabNamesArray[index.value]
-        scrollToImpl(
-          refMap[name],
-          0,
-          scrollYCurrent.value - contentInset,
-          false
-        )
+    const getTabBarHeight = React.useCallback(
+      event => {
+        const height = event.nativeEvent.layout.height;
+        if (tabBarHeight.value !== height) tabBarHeight.value = height;
+      },
+      [tabBarHeight]
+    );
+
+    const onLayout = React.useCallback(
+      event => {
+        const height = event.nativeEvent.layout.height;
+        if (containerHeight.value !== height) containerHeight.value = height;
+      },
+      [containerHeight]
+    );
+
+    const onTabPress = React.useCallback(
+      name => {
+        const i = tabNames.value.findIndex(n => n === name);
+
+        if (name === focusedTab.value) {
+          const ref = refMap[name];
+          runOnUI(scrollToImpl)(ref, 0, headerScrollDistance.value - contentInset.value, true);
+        } else {
+          containerRef.current?.setPage(i);
+        }
+      },
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [containerRef, refMap, contentInset]
+    );
+
+    React.useEffect(() => {
+      if (index.value >= tabNamesArray.length) {
+        onTabPress(tabNamesArray[tabNamesArray.length - 1]);
       }
+    }, [index.value, onTabPress, tabNamesArray]);
 
-      /*
-       * We run syncCurrentTabScrollPosition in every frame after the index
-       * changes for about 1500ms because the Lists can be late to accept the
-       * scrollTo event we send. This fixes the issue of the scroll position
-       * jumping when the user changes tab.
-       * */
-      const toggleSyncScrollFrame = (toggle: boolean) =>
-        syncScrollFrame.setActive(toggle)
-      const syncScrollFrame = useFrameCallback(({ timeSinceFirstFrame }) => {
-        syncCurrentTabScrollPosition()
-        if (timeSinceFirstFrame > 1500) {
-          runOnJS(toggleSyncScrollFrame)(false)
-        }
-      }, false)
+    const pageScrollHandler = usePageScrollHandler({
+      onPageScroll: e => {
+        'worklet';
+        indexDecimal.value = e.position + e.offset;
+      },
+    });
 
-      useAnimatedReaction(
-        () => {
-          return calculateNextOffset.value
+    React.useImperativeHandle(
+      ref,
+      () => ({
+        setIndex: index => {
+          const name = tabNames.value[index];
+          onTabPress(name);
+          return true;
         },
-        (i) => {
-          if (i !== index.value) {
-            offset.value =
-              scrollY.value[tabNames.value[index.value]] -
-              scrollY.value[tabNames.value[i]] +
-              offset.value
-            runOnJS(propagateTabChange)({
-              prevIndex: index.value,
-              index: i,
-              prevTabName: tabNames.value[index.value],
-              tabName: tabNames.value[i],
-            })
-            index.value = i
-            if (
-              typeof scrollY.value[tabNames.value[index.value]] === 'number'
-            ) {
-              scrollYCurrent.value =
-                scrollY.value[tabNames.value[index.value]] || 0
-            }
-            runOnJS(toggleSyncScrollFrame)(true)
-          }
+        jumpToTab: name => {
+          onTabPress(name);
+          return true;
         },
-        []
-      )
-
-      useAnimatedReaction(
-        () => headerHeight,
-        (_current, prev) => {
-          if (prev === undefined) {
-            // sync scroll if we started with undefined header height
-            resyncTabScroll()
-          }
-        }
-      )
-
-      const headerTranslateY = useDerivedValue(() => {
-        return revealHeaderOnScroll
-          ? -accDiffClamp.value
-          : -Math.min(scrollYCurrent.value, headerScrollDistance.value)
-      }, [revealHeaderOnScroll])
-
-      const stylez = useAnimatedStyle(() => {
-        return {
-          transform: [
-            {
-              translateY: headerTranslateY.value,
-            },
-          ],
-        }
-      }, [revealHeaderOnScroll])
-
-      const onTabPress = React.useCallback(
-        (name: TabName) => {
-          const i = tabNames.value.findIndex((n) => n === name)
-
-          if (name === focusedTab.value) {
-            const ref = refMap[name]
-            runOnUI(scrollToImpl)(
-              ref,
-              0,
-              headerScrollDistance.value - contentInset,
-              true
-            )
-          } else {
-            containerRef.current?.setPage(i)
-          }
+        getFocusedTab: () => {
+          return tabNames.value[index.value];
         },
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-        [containerRef, refMap, contentInset]
-      )
-
-      useAnimatedReaction(
-        () => tabNamesArray.length,
-        (tabLength) => {
-          if (index.value >= tabLength) {
-            runOnJS(onTabPress)(tabNamesArray[tabLength - 1])
-          }
-        }
-      )
-
-      const pageScrollHandler = usePageScrollHandler({
-        onPageScroll: (e) => {
-          'worklet'
-          indexDecimal.value = e.position + e.offset
+        getCurrentIndex: () => {
+          return index.value;
         },
-      })
+      }),
+      [onTabPress]
+    );
 
-      React.useImperativeHandle(
-        ref,
-        () => ({
-          setIndex: (index) => {
-            const name = tabNames.value[index]
-            onTabPress(name)
-            return true
-          },
-          jumpToTab: (name) => {
-            onTabPress(name)
-            return true
-          },
-          getFocusedTab: () => {
-            return tabNames.value[index.value]
-          },
-          getCurrentIndex: () => {
-            return index.value
-          },
-        }),
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-        [onTabPress]
-      )
-
-      return (
-        <Context.Provider
-          value={{
-            contentInset,
-            tabBarHeight,
-            headerHeight,
-            refMap,
-            tabNames,
-            index,
-            snapThreshold,
-            revealHeaderOnScroll,
-            focusedTab,
-            accDiffClamp,
-            indexDecimal,
-            containerHeight,
-            minHeaderHeight,
-            scrollYCurrent,
-            scrollY,
-            setRef,
-            headerScrollDistance,
-            accScrollY,
-            oldAccScrollY,
-            offset,
-            snappingTo,
-            contentHeights,
-            headerTranslateY,
-            width,
-            allowHeaderOverscroll,
-          }}
+    return (
+      <Context.Provider
+        value={{
+          contentInset,
+          tabBarHeight,
+          headerHeight,
+          refMap,
+          tabNames,
+          index,
+          snapThreshold,
+          revealHeaderOnScroll,
+          focusedTab,
+          accDiffClamp,
+          indexDecimal,
+          containerHeight,
+          minHeaderHeight,
+          scrollYCurrent,
+          scrollY,
+          setRef,
+          headerScrollDistance,
+          accScrollY,
+          oldAccScrollY,
+          offset,
+          snappingTo,
+          contentHeights,
+          headerTranslateY,
+          width,
+          allowHeaderOverscroll,
+        }}
+      >
+        <Animated.View
+          style={[styles.container, { width }, containerStyle]}
+          onLayout={onLayout}
+          pointerEvents="box-none"
         >
           <Animated.View
-            style={[styles.container, { width }, containerStyle]}
-            onLayout={getContainerLayoutHeight}
             pointerEvents="box-none"
+            style={[styles.topContainer, headerContainerStyle, !cancelTranslation && stylez]}
           >
-            <Animated.View
+            <View
+              style={[styles.container, styles.headerContainer]}
+              onLayout={getHeaderHeight}
               pointerEvents="box-none"
-              style={[
-                styles.topContainer,
-                headerContainerStyle,
-                !cancelTranslation && stylez,
-              ]}
             >
-              <View
-                style={[styles.container, styles.headerContainer]}
-                onLayout={getHeaderHeight}
-                pointerEvents="box-none"
-              >
-                {renderHeader &&
-                  renderHeader({
-                    containerRef,
-                    index,
-                    tabNames: tabNamesArray,
-                    focusedTab,
-                    indexDecimal,
-                    onTabPress,
-                    tabProps,
-                  })}
-              </View>
-              <View
-                style={[styles.container, styles.tabBarContainer]}
-                onLayout={getTabBarHeight}
-                pointerEvents="box-none"
-              >
-                {renderTabBar &&
-                  renderTabBar({
-                    containerRef,
-                    index,
-                    tabNames: tabNamesArray,
-                    focusedTab,
-                    indexDecimal,
-                    width,
-                    onTabPress,
-                    tabProps,
-                  })}
-              </View>
-            </Animated.View>
-
-            <AnimatedPagerView
-              ref={containerRef}
-              onPageScroll={pageScrollHandler}
-              initialPage={initialIndex}
-              {...pagerProps}
-              style={[pagerProps?.style, StyleSheet.absoluteFill]}
-            >
-              {tabNamesArray.map((tabName, i) => {
-                return (
-                  <View key={i}>
-                    <TabNameContext.Provider value={tabName}>
-                      <Lazy
-                        startMounted={lazy ? undefined : true}
-                        cancelLazyFadeIn={!lazy ? true : !!cancelLazyFadeIn}
-                        // ensure that we remount the tab if its name changes but the index doesn't
-                        key={tabName}
-                      >
-                        {
-                          React.Children.toArray(children)[
-                            i
-                          ] as React.ReactElement
-                        }
-                      </Lazy>
-                    </TabNameContext.Provider>
-                  </View>
-                )
+              {renderHeader && renderHeader({
+                containerRef,
+                index,
+                tabNames: tabNamesArray,
+                focusedTab,
+                indexDecimal,
+                onTabPress,
+                tabProps,
               })}
-            </AnimatedPagerView>
+            </View>
+            <View
+              style={[styles.container, styles.tabBarContainer]}
+              onLayout={getTabBarHeight}
+              pointerEvents="box-none"
+            >
+              {renderTabBar && renderTabBar({
+                containerRef,
+                index,
+                tabNames: tabNamesArray,
+                focusedTab,
+                indexDecimal,
+                width,
+                onTabPress,
+                tabProps,
+              })}
+            </View>
           </Animated.View>
-        </Context.Provider>
-      )
-    }
-  )
-)
+          <AnimatedPagerView
+            ref={containerRef}
+            onPageScroll={pageScrollHandler}
+            initialPage={index.value}
+            {...pagerProps}
+            style={[pagerProps?.style, StyleSheet.absoluteFill]}
+          >
+            {tabNamesArray.map((tabName, i) => (
+              <View key={i}>
+                <TabNameContext.Provider value={tabName}>
+                  <Lazy
+                    startMounted={lazy ? undefined : true}
+                    cancelLazyFadeIn={!lazy ? true : !!cancelLazyFadeIn}
+                    // ensure that we remount the tab if its name changes but the index doesn't
+                    key={tabName}
+                  >
+                    {React.Children.toArray(children)[i]}
+                  </Lazy>
+                </TabNameContext.Provider>
+              </View>
+            ))}
+          </AnimatedPagerView>
+        </Animated.View>
+      </Context.Provider>
+    );
+  })
+);
 
 const styles = StyleSheet.create({
   container: {
@@ -486,4 +399,4 @@ const styles = StyleSheet.create({
   headerContainer: {
     zIndex: 2,
   },
-})
+});
